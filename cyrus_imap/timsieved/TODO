@@ -1,0 +1,8 @@
+$Id: TODO,v 1.4 2005/03/05 00:37:39 dasenbro Exp $
+
+does authenticating leak memory?  (mechanism name parameter in yacc
+not freed?)
+	- leg 9/29/99
+
+document the sieve quotas in:
+	sieve.html (yet to be written)

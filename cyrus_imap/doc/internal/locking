@@ -1,0 +1,11 @@
+$Id: locking,v 1.5 2005/03/05 00:36:27 dasenbro Exp $
+
+In an ideal world, our locking order is:
+
+cyrus.header
+cyrus.index
+quota
+seen
+mailboxes file
+
+

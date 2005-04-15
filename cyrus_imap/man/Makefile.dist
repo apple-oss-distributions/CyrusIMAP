@@ -1,0 +1,3 @@
+# $Id: Makefile.dist,v 1.2 2005/03/05 00:37:24 dasenbro Exp $
+dist:
+	../tools/config2man ../lib/imapoptions > imapd.conf.5
