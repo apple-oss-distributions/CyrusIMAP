@@ -39,7 +39,7 @@
  * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-/* $Id: cyrusdb_quotalegacy.c,v 1.4 2005/03/05 00:37:13 dasenbro Exp $ */
+/* $Id: cyrusdb_quotalegacy.c,v 1.14 2007/02/05 18:43:26 jeaton Exp $ */
 
 #include <config.h>
 
@@ -55,7 +55,11 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <fcntl.h>
+#ifdef XCODE_BUILD
+#include </usr/include/glob.h>
+#else 
 #include <glob.h>
+#endif
 
 #include "assert.h"
 #include "cyrusdb.h"
@@ -67,6 +71,8 @@
 #include "retry.h"
 #include "util.h"
 #include "xmalloc.h"
+#include "xstrlcpy.h"
+#include "xstrlcat.h"
 
 #define FNAME_QUOTADIR "/quota/"
 #define MAX_QUOTA_PATH 4096

@@ -1,5 +1,5 @@
 /* lmtpengine.c: LMTP protocol engine
- * $Id: lmtpengine.c,v 1.8 2005/03/23 00:39:22 dasenbro Exp $
+ * $Id: lmtpengine.c,v 1.118 2007/02/05 18:41:47 jeaton Exp $
  *
  * Copyright (c) 1998-2003 Carnegie Mellon University.  All rights reserved.
  *
@@ -81,6 +81,8 @@
 #include "imap_err.h"
 #include "mupdate_err.h"
 #include "xmalloc.h"
+#include "xstrlcpy.h"
+#include "xstrlcat.h"
 #include "version.h"
 
 #include "lmtpengine.h"
@@ -88,7 +90,9 @@
 #include "tls.h"
 #include "telemetry.h"
 
+#ifdef APPLE_OS_X_SERVER
 #include "AppleOD.h"
+#endif
 
 #define RCPT_GROW 30
 
@@ -96,7 +100,10 @@
 struct address_data {
     char *all;		/* storage for entire RCPT TO addr -- MUST be freed */
     char *rcpt;		/* storage for user[+mbox][@domain] -- MUST be freed */
+#ifdef APPLE_OS_X_SERVER
     char *virt;		/* storage for virtual recipient addr -- MUST be freed */
+    char *afwd;		/* storage for auto-forward recipient addr -- MUST be freed */
+#endif
     char *user;		/* pointer to user part of rcpt -- DO NOT be free */
     char *domain;	/* pointer to domain part of rcpt -- DO NOT be free */
     char *mailbox;	/* pointer to mailbox part of rcpt -- DO NOT be free */
@@ -125,6 +132,12 @@ struct clientdata {
 #endif /* HAVE_SSL */
     int starttls_done;
 };
+
+#ifdef APPLE_OS_X_SERVER
+/* current user mail options */
+struct od_user_opts	*gUserOpts = NULL;
+char *gLUser_relay_str = NULL;
+#endif
 
 /* defined in lmtpd.c or lmtpproxyd.c */
 extern int deliver_logfd;
@@ -319,7 +332,10 @@ void msg_free(message_data_t *m)
     if (m->rcpt) {
 	for (i = 0; i < m->rcpt_num; i++) {
 	    if (m->rcpt[i]->all) free(m->rcpt[i]->all);
+#ifdef APPLE_OS_X_SERVER
 	    if (m->rcpt[i]->virt) free(m->rcpt[i]->virt);
+	    if (m->rcpt[i]->afwd) free(m->rcpt[i]->afwd);
+#endif
 	    if (m->rcpt[i]->rcpt) free(m->rcpt[i]->rcpt);
 	    free(m->rcpt[i]);
 	}
@@ -330,6 +346,12 @@ void msg_free(message_data_t *m)
 	free(m->authuser);
 	if (m->authstate) auth_freestate(m->authstate);
     }
+
+#ifdef APPLE_OS_X_SERVER
+	if (gUserOpts) {
+	odFreeUserOpts(gUserOpts, 0);
+	}
+#endif
 
     spool_free_hdrcache(m->hdrcache);
 
@@ -354,12 +376,20 @@ int msg_getnumrcpt(message_data_t *m)
 }
 
 void msg_getrcpt(message_data_t *m, int rcpt_num,
+#ifdef APPLE_OS_X_SERVER
+		 const char **user, const char **domain, const char **mailbox,
+		 const char **auto_fwd)
+#else
 		 const char **user, const char **domain, const char **mailbox)
+#endif
 {
     assert(0 <= rcpt_num && rcpt_num < m->rcpt_num);
     if (user) *user =  m->rcpt[rcpt_num]->user;
     if (domain) *domain =  m->rcpt[rcpt_num]->domain;
     if (mailbox) *mailbox =  m->rcpt[rcpt_num]->mailbox;
+#ifdef APPLE_OS_X_SERVER
+    if (auto_fwd) *auto_fwd =  m->rcpt[rcpt_num]->afwd;
+#endif
 }
 
 const char *msg_getrcptall(message_data_t *m, int rcpt_num)
@@ -778,7 +808,7 @@ static int savemsg(struct clientdata *cd,
 		   error_message(errno));
 	}
 	fclose(f);
-	func->removespool(m);
+	if (func->removespool) func->removespool(m);
 	return IMAP_IOERROR;
     }
 
@@ -789,7 +819,7 @@ static int savemsg(struct clientdata *cd,
 			error_message(errno));
 	}
 	fclose(f);
-	func->removespool(m);
+	if (func->removespool) func->removespool(m);
 	return IMAP_IOERROR;
     }
     m->size = sbuf.st_size;
@@ -805,20 +835,23 @@ static int savemsg(struct clientdata *cd,
 static int process_recipient(char *addr, struct namespace *namespace,
 			     int ignorequota,
 			     int (*verify_user)(const char *, const char *,
-						const char *, long,
+						char *, long,
 						struct auth_state *),
 			     message_data_t *msg)
 {
     char *dest;
     char *rcpt;
+#ifdef APPLE_OS_X_SERVER
     const char *luser_relay = NULL;
-    char *luser_relay_str = NULL;
     int has_luser_relay = 0;
+#endif
     int r, sl;
     address_data_t *ret = (address_data_t *) xmalloc(sizeof(address_data_t));
     int forcedowncase = config_getswitch(IMAPOPT_LMTP_DOWNCASE_RCPT);
     int quoted, detail;
-    struct od_user_opts	useropts;
+#ifdef APPLE_OS_X_SERVER
+    struct od_user_opts	*pUserOpts = NULL;
+#endif
 
     assert(addr != NULL && msg != NULL);
 
@@ -875,35 +908,89 @@ static int process_recipient(char *addr, struct namespace *namespace,
     }
     *dest = '\0';
 
+#ifdef APPLE_OS_X_SERVER
 	/* is relay unknown local users enabled */
     luser_relay = config_getstring(IMAPOPT_LMTP_LUSER_RELAY);
     if ( luser_relay )
 	{
-		/* get record name for this user, could be an alias */
-		odGetUserOpts( luser_relay, &useropts );
-		if ( useropts.fRecName[ 0 ] != '\0' )
+		/* have already looked up the relay user */
+		if ( gLUser_relay_str == NULL )
 		{
-			/* verify that we can send mail to this user */
-			if( !verify_user( useropts.fRecName, NULL, "", ignorequota ? -1 : msg->size, msg->authstate) )
+			if ( pUserOpts == NULL )
 			{
-				has_luser_relay = 1;
-				luser_relay_str = xstrdup( useropts.fRecName );
+				pUserOpts = xzmalloc( sizeof(struct od_user_opts) );
 			}
+
+			/* get record name for this user, could be an alias */
+			odGetUserOpts( luser_relay, pUserOpts );
+			if ( pUserOpts->fRecNamePtr != NULL )
+			{
+				/* verify that we can send mail to this user */
+				if( !verify_user( pUserOpts->fRecNamePtr, NULL, "", ignorequota ? -1 : msg->size, msg->authstate) )
+				{
+					has_luser_relay = 1;
+					gLUser_relay_str = xstrdup( pUserOpts->fRecNamePtr );
+				}
+			}
+
+			odFreeUserOpts( pUserOpts, 1 );
+			free( pUserOpts );
+			pUserOpts = NULL;
+		}
+		else
+		{
+			has_luser_relay = 1;
 		}
     }
-
+	else
+	{
+		if ( gLUser_relay_str != NULL )
+		{
+			free( gLUser_relay_str );
+			gLUser_relay_str = NULL;
+		}
+	}
+#endif
+	
     /* make a working copy of rcpt */
     ret->user = ret->rcpt = xstrdup(rcpt);
 
+#ifdef APPLE_OS_X_SERVER
     /* set virtual domain holder to NULL */
     ret->virt = NULL;
+	ret->afwd = NULL;
+
+	/* alloc global user opts struct if not already */
+	if ( gUserOpts == NULL )
+	{
+		gUserOpts = xzmalloc( sizeof(struct od_user_opts) );
+	}
 
     /* lookup user short name (could be an alias) */
-    odGetUserOpts( ret->user, &useropts );
-    if ( useropts.fRecName[ 0 ] != '\0' ) {
-	    ret->virt = xstrdup( useropts.fRecName );
+	char *p = NULL;
+	p = strchr( ret->user, '+' );
+	if ( p != NULL )
+	{
+		/* lookup just the user name */
+		*p = '\0';
+		odGetUserOpts( ret->user, gUserOpts );
+		*p = '+';
+	}
+	else
+	{
+		odGetUserOpts( ret->user, gUserOpts );
+	}
+
+    if ( gUserOpts->fRecNamePtr != NULL )
+	{
+		if ( forcedowncase )
+		{
+			lcase( gUserOpts->fRecNamePtr );
+		}
+	    ret->virt = xstrdup( gUserOpts->fRecNamePtr );
 	    ret->user = ret->virt;
     }
+#endif
 
     /* find domain */
     ret->domain = NULL;
@@ -912,13 +999,17 @@ static int process_recipient(char *addr, struct namespace *namespace,
 	/* ignore default domain */
 	if (config_defdomain && !strcasecmp(config_defdomain, ret->domain))
 	    ret->domain = NULL;
+#ifdef APPLE_OS_X_SERVER
+//	else if ( config_getswitch( IMAPOPT_VIRTUAL_USER_LOOKUP ) && strrchr(ret->all, '@') )
+//	odGetUserOpts( ret->all, gUserOpts );
     } else if ( strrchr(ret->all, '@') ) {
-	odGetUserOpts( ret->all, &useropts );
-	if ( useropts.fRecName[ 0 ] != '\0' ) {
+	odGetUserOpts( ret->user, gUserOpts );
+	if ( gUserOpts->fRecNamePtr != NULL ) {
 	    if (ret->virt) free(ret->virt);
-	    ret->virt = xstrdup( useropts.fRecName );
+	    ret->virt = xstrdup( gUserOpts->fRecNamePtr );
 	    ret->user = ret->virt;
 	}
+#endif
     }
 
     /* translate any separators in user & mailbox */
@@ -933,27 +1024,45 @@ static int process_recipient(char *addr, struct namespace *namespace,
 
     r = verify_user(ret->user, ret->domain, ret->mailbox,
 		    ignorequota ? -1 : msg->size, msg->authstate);
-    if ( r == IMAP_MAILBOX_NONEXISTENT && has_luser_relay )
+#ifdef APPLE_OS_X_SERVER
+    if ( r == IMAP_AUTO_FORWARD_USER )
+	{
+	    ret->afwd = xstrdup( gUserOpts->fAutoFwdPtr );
+	}
+    else if ( r == IMAP_MAILBOX_NONEXISTENT && has_luser_relay )
 	{
 		if (ret->virt) free(ret->virt);
-	    ret->virt = xstrdup( luser_relay_str );
+	    ret->virt = xstrdup( gLUser_relay_str );
 	    ret->user = ret->virt;
     }
-	else if( r == IMAP_MAILBOX_NONEXISTENT && !has_luser_relay )
+	else if ( r == IMAP_MAILBOX_NONEXISTENT && !has_luser_relay )
 	{
 	/* we lost */
-	if (luser_relay_str) free(luser_relay_str);
 	if (ret->all) free(ret->all);
 	if (ret->virt) free(ret->virt);
 	if (ret->rcpt) free(ret->rcpt);
 	if (ret) free(ret);
+	if (gUserOpts) {
+	odFreeUserOpts(gUserOpts, 1);
+	free(gUserOpts);
+	gUserOpts = NULL;
+	}
 	return r;
     }
+	if (ret->user != NULL)
+		mboxname_hiersep_tointernal( namespace, ret->user, 0 );
+#else
+    if (r) {
+	/* we lost */
+	free(ret->all);
+	free(ret->rcpt);
+	free(ret);
+	return r;
+    }
+#endif
     ret->ignorequota = ignorequota;
 
     msg->rcpt[msg->rcpt_num] = ret;
-
-	if (luser_relay_str) free(luser_relay_str);
 
     return 0;
 }
@@ -1366,7 +1475,7 @@ void lmtpmode(struct lmtp_func *func,
       case 'l':
       case 'L':
 	  if (!strncasecmp(buf, "lhlo ", 5)) {
-	      unsigned int mechcount;
+	      int mechcount;
 	      const char *mechs;
 	      
 	      prot_printf(pout, "250-%s\r\n"
@@ -1606,7 +1715,7 @@ void lmtpmode(struct lmtp_func *func,
 
 		/* SASL and openssl have different ideas
 		   about whether ssf is signed */
-		layerp = &ssf;
+		layerp = (int *) &ssf;
 
 		if (cd.starttls_done == 1) {
 		    prot_printf(pout, "454 4.3.3 %s\r\n", 
