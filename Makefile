@@ -19,7 +19,7 @@ CFLAGS=-Os $(RC_CFLAGS)
 #
 
 PROJECT_NAME=cyrus_imap
-SW_VERS=`sw_vers | grep BuildVersion | sed 's/^.*://'`
+SW_VERS=`sw_vers -buildVersion`
 
 OPEN_SRC_INFO_SRC_DIR=/CyrusIMAP.OpenSourceInfo
 OPEN_SRC_VERS_DST_DIR=/usr/local/OpenSourceVersions
